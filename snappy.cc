@@ -693,7 +693,8 @@ static inline void Report(const char *algorithm, size_t compressed_size,
 //
 //   // Called repeatedly during decompression
 //   bool Append(const char* ip, size_t length);
-//   bool AppendFromSelf(uint32 offset, size_t length, bool fast_path);
+//   template <bool allow_fast_path>
+//   bool AppendFromSelf(uint32 offset, size_t length);
 //
 //   // The rules for how TryFastAppend differs from Append are somewhat
 //   // convoluted:
@@ -874,7 +875,7 @@ class SnappyDecompressor {
         if (copy_tag_pos == 0) {
           assert(literal_length == 0);
         } else {
-          assert (copy_tag_pos == literal_length + 1);
+          assert(copy_tag_pos == literal_length + 1);
         }
         // Fast path, just a predictable output check
       } else {
@@ -945,7 +946,7 @@ class SnappyDecompressor {
       const size_t copy_offset = trailer + copy_offset_adjustment;
       if (SNAPPY_PREDICT_TRUE(copy_length <= CSD_CPY_SHORT_SIZE && copy_offset >= 8)) {
         // Fast path
-        if (!writer->AppendFromSelf(copy_offset, copy_length, true)) {
+        if (!writer->template AppendFromSelf<true>(copy_offset, copy_length)) {
           assert(0);
           return;
         }
@@ -953,12 +954,12 @@ class SnappyDecompressor {
         // copy_offset/256 is encoded in bits 8..10.  By just fetching
         // those bits, we get copy_offset (since the bit-field starts at
         // bit 8).
-        if (!writer->AppendFromSelf(copy_offset, copy_length, false)) {
+        if (!writer->template AppendFromSelf<false>(copy_offset, copy_length)) {
           assert(0);
           return;
         }
+        MAYBE_REFILL();
       }
-      MAYBE_REFILL();
     }
 
     MAYBE_REFILL();
@@ -1024,7 +1025,7 @@ class SnappyDecompressor {
         // those bits, we get copy_offset (since the bit-field starts at
         // bit 8).
         const size_t copy_offset = entry & 0x700;
-        if (!writer->AppendFromSelf(copy_offset + trailer, length, false)) {
+        if (!writer->template AppendFromSelf<false>(copy_offset + trailer, length)) {
           return;
         }
         MAYBE_REFILL();
@@ -1302,7 +1303,8 @@ class SnappyIOVecWriter {
     return false;
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
+  template <bool allow_fast_path>
+  inline bool AppendFromSelf(size_t offset, size_t len) {
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
     if (offset - 1u >= total_written_) {
@@ -1440,7 +1442,9 @@ class SnappyArrayWriter {
     }
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len, bool fast_path) {
+  template <bool allow_fast_path>
+  __attribute__((always_inline))
+  inline bool AppendFromSelf(size_t offset, size_t len) {
     char* const op_end = op_ + len;
     char* const match = op_ - offset;
 
@@ -1454,7 +1458,7 @@ class SnappyArrayWriter {
     if (Produced() <= offset - 1u || op_end > op_limit_) return false;
 
     // Fast path, offset >= 8 and len <= 32
-    if (fast_path && len <= 32 && offset >= 8 && op_ + 32 <= op_limit_) {
+    if (allow_fast_path && op_ + 32 <= op_limit_) {
       assert(len <= 32);
       assert(offset >= 8);
       UnalignedCopy64(match, op_);
@@ -1521,7 +1525,8 @@ class SnappyDecompressionValidator {
   inline bool TryFastAppend(const char* ip, size_t available, size_t length) {
     return length == 0;
   }
-  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
+  template <bool allow_fast_path>
+  inline bool AppendFromSelf(size_t offset, size_t len) {
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
     if (produced_ <= offset - 1u) return false;
@@ -1646,7 +1651,8 @@ class SnappyScatteredWriter {
     }
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
+  template <bool allow_fast_path>
+  inline bool AppendFromSelf(size_t offset, size_t len) {
     char* const op_end = op_ptr_ + len;
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
