@@ -477,7 +477,7 @@ class LogMessage {
 
 #define CRASH_UNLESS(condition) \
     SNAPPY_PREDICT_TRUE(condition) ? (void)0 : \
-    snappy::LogMessageVoidify() & snappy::LogMessageCrash()
+    snappy::LogMessageVoidify() & snappy::LogMessageCrash() << __FILE__ << ":" << __LINE__ << ": CHECK(" << #condition << ") failed!"
 
 #ifdef _MSC_VER
 // ~LogMessageCrash calls abort() and therefore never exits. This is by design

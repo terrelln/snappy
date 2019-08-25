@@ -25,7 +25,7 @@
 // THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+#include <stdio.h>
 #include "snappy.h"
 #include "snappy-internal.h"
 #include "snappy-sinksource.h"
@@ -693,13 +693,13 @@ static inline void Report(const char *algorithm, size_t compressed_size,
 //
 //   // Called repeatedly during decompression
 //   bool Append(const char* ip, size_t length);
-//   bool AppendFromSelf(uint32 offset, size_t length);
+//   bool AppendFromSelf(uint32 offset, size_t length, bool fast_path);
 //
 //   // The rules for how TryFastAppend differs from Append are somewhat
 //   // convoluted:
 //   //
 //   //  - TryFastAppend is allowed to decline (return false) at any
-//   //    time, for any reason -- just "return false" would be
+//   //    time, for any reason unless length is 0 -- just "return false" would be
 //   //    a perfectly legal implementation of TryFastAppend.
 //   //    The intention is for TryFastAppend to allow a fast path
 //   //    in the common case of a small append.
@@ -826,6 +826,18 @@ class SnappyDecompressor {
     asm(".byte 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00");
 #endif
 
+    #define CSD_MAX_TAG_SIZE 5
+    #define CSD_LIT_SHORT_SIZE 16
+    #define CSD_OFF_SHORT_SIZE 8
+    #define CSD_CPY_SHORT_SIZE 32
+
+    #define CSD_LIT_OVER_SIZE 64
+    #define CSD_SHORTCUT_OVER_IN (CSD_MAX_TAG_SIZE + CSD_LIT_OVER_SIZE + CSD_MAX_TAG_SIZE + 1)
+    #define CSD_SHORTCUT_OVER_OUT (CSD_LIT_OVER_SIZE + CSD_CPY_SHORT_SIZE)
+
+    #define CSD_SHORTCUT_OVER2_IN CSD_MAX(CSD_MAX_TAG_SIZE + 1, 32)
+    #define CSD_SHORTCUT_OVER2_OUT CSD_MAX(CSD_CPY_SHORT_SIZE, 32
+    
     const char* ip = ip_;
     // We could have put this refill fragment only at the beginning of the loop.
     // However, duplicating it at the end of each branch gives the compiler more
@@ -837,6 +849,117 @@ class SnappyDecompressor {
           if (!RefillTag()) return; \
           ip = ip_; \
         }
+
+    MAYBE_REFILL();
+    unsigned char next_literal_tag = *(reinterpret_cast<const unsigned char*>(ip));
+    while (ip_limit_ - ip >= CSD_SHORTCUT_OVER_IN) {
+      // auto const* anchor = ip;
+      const unsigned char literal_tag = next_literal_tag;
+      int const literal_mask = (literal_tag & 3) - 1;
+      size_t literal_length = ((4 + literal_tag) & literal_mask) >> 2;
+      size_t const copy_tag_pos = ((8 + literal_tag) & literal_mask) >> 2;
+      const unsigned char copy_tag = *(reinterpret_cast<const unsigned char*>(ip) + copy_tag_pos);
+      size_t const copy_offset_bytes = (1 << (copy_tag & 3)) >> 1;
+      assert(copy_offset_bytes >= 0);
+      assert(copy_offset_bytes <= 4);
+      int const copy_mask = (int)(copy_offset_bytes - 2) >> 2; // Low bit is 0 or 1: shift if needed. 1s if 2+
+      assert(copy_mask == 0 || copy_mask == -1);
+      size_t copy_mask_3 = 3 & copy_mask;
+      size_t const copy_length = 1 + copy_mask_3 + ((uint8_t)(copy_tag << copy_mask_3) >> (2 + copy_mask_3));
+      size_t const copy_offset_adjustment = ((copy_tag >> 5) << 8) & copy_mask;
+
+      if (literal_length <= CSD_LIT_SHORT_SIZE &&
+          writer->TryFastAppend(ip + 1, CSD_SHORTCUT_OVER_IN - 1, literal_length)) {
+        ip += copy_tag_pos;
+        if (copy_tag_pos == 0) {
+          assert(literal_length == 0);
+        } else {
+          assert (copy_tag_pos == literal_length + 1);
+        }
+        // Fast path, just a predictable output check
+      } else {
+        ++ip;
+        assert(literal_length > 0);
+        assert(ip_limit_ - ip >= 61);
+        if (writer->TryFastAppend(ip, ip_limit_ - ip, literal_length)) {
+          assert(literal_length < 61);
+        } else if (literal_length < 61) {
+          if (!writer->Append(ip, literal_length)) {
+            assert(0);
+            return;
+          }
+        } else {
+          // Long literal.
+          const size_t literal_length_length = literal_length - 60;
+          literal_length =
+              ExtractLowBytes(LittleEndian::Load32(ip), literal_length_length) +
+              1;
+          ip += literal_length_length;
+
+          size_t avail = ip_limit_ - ip;
+          while (avail < literal_length) {
+            if (!writer->Append(ip, avail)) {
+              assert(0);
+              return;
+            }
+            literal_length -= avail;
+            reader_->Skip(peeked_);
+            size_t n;
+            ip = reader_->Peek(&n);
+            avail = n;
+            peeked_ = avail;
+            if (avail == 0) {
+              assert(0);
+              return;  // Premature end of input
+            }
+            ip_limit_ = ip + avail;
+          }
+          if (!writer->Append(ip, literal_length)) {
+            assert(0);
+            return;
+          }
+          ip += literal_length;
+          // We got the copy_tag_pos wrong, and also may not have enough bytes left, so go back to the top.
+          MAYBE_REFILL();
+          next_literal_tag = *(reinterpret_cast<const unsigned char*>(ip));
+          continue;
+        }
+        ip += literal_length;
+      }
+      // Double literals
+      if (SNAPPY_PREDICT_FALSE((copy_tag & 3) == 0)) {
+        next_literal_tag = copy_tag;
+        continue;
+      }
+      // size_t const copy_entry = char_table[(uint8_t)*ip];
+      // assert(anchor + copy_tag_pos == ip);
+      // assert((copy_tag & 3) > 0);
+      // assert((copy_entry >> 11) == copy_offset_bytes);
+      // assert((copy_entry & 0x700) == copy_offset_adjustment);
+      ++ip;
+      const size_t trailer =
+          ExtractLowBytes(LittleEndian::Load32(ip), copy_offset_bytes);
+      ip += copy_offset_bytes;
+      assert(ip < ip_limit_);
+      next_literal_tag = *(reinterpret_cast<const unsigned char*>(ip));
+      const size_t copy_offset = trailer + copy_offset_adjustment;
+      if (SNAPPY_PREDICT_TRUE(copy_length <= CSD_CPY_SHORT_SIZE && copy_offset >= 8)) {
+        // Fast path
+        if (!writer->AppendFromSelf(copy_offset, copy_length, true)) {
+          assert(0);
+          return;
+        }
+      } else {
+        // copy_offset/256 is encoded in bits 8..10.  By just fetching
+        // those bits, we get copy_offset (since the bit-field starts at
+        // bit 8).
+        if (!writer->AppendFromSelf(copy_offset, copy_length, false)) {
+          assert(0);
+          return;
+        }
+      }
+      MAYBE_REFILL();
+    }
 
     MAYBE_REFILL();
     for ( ;; ) {
@@ -901,7 +1024,7 @@ class SnappyDecompressor {
         // those bits, we get copy_offset (since the bit-field starts at
         // bit 8).
         const size_t copy_offset = entry & 0x700;
-        if (!writer->AppendFromSelf(copy_offset + trailer, length)) {
+        if (!writer->AppendFromSelf(copy_offset + trailer, length, false)) {
           return;
         }
         MAYBE_REFILL();
@@ -1172,11 +1295,14 @@ class SnappyIOVecWriter {
       total_written_ += len;
       return true;
     }
+    if (len == 0) {
+      return true;
+    }
 
     return false;
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len) {
+  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
     if (offset - 1u >= total_written_) {
@@ -1310,12 +1436,13 @@ class SnappyArrayWriter {
       op_ = op + len;
       return true;
     } else {
-      return false;
+      return len == 0;
     }
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len) {
+  inline bool AppendFromSelf(size_t offset, size_t len, bool fast_path) {
     char* const op_end = op_ + len;
+    char* const match = op_ - offset;
 
     // Check if we try to append from before the start of the buffer.
     // Normally this would just be a check for "produced < offset",
@@ -1325,7 +1452,20 @@ class SnappyArrayWriter {
     // invalid case that we also want to catch, so that we do not go
     // into an infinite loop.
     if (Produced() <= offset - 1u || op_end > op_limit_) return false;
-    op_ = IncrementalCopy(op_ - offset, op_, op_end, op_limit_);
+
+    // Fast path, offset >= 8 and len <= 32
+    if (fast_path && len <= 32 && offset >= 8 && op_ + 32 <= op_limit_) {
+      assert(len <= 32);
+      assert(offset >= 8);
+      UnalignedCopy64(match, op_);
+      UnalignedCopy64(match + 8, op_ + 8);
+      UnalignedCopy64(match + 16, op_ + 16);
+      UnalignedCopy64(match + 24, op_ + 24);
+      op_ = op_end;
+      return true;
+    }
+
+    op_ = IncrementalCopy(match, op_, op_end, op_limit_);
 
     return true;
   }
@@ -1379,9 +1519,9 @@ class SnappyDecompressionValidator {
     return produced_ <= expected_;
   }
   inline bool TryFastAppend(const char* ip, size_t available, size_t length) {
-    return false;
+    return length == 0;
   }
-  inline bool AppendFromSelf(size_t offset, size_t len) {
+  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
     if (produced_ <= offset - 1u) return false;
@@ -1502,11 +1642,11 @@ class SnappyScatteredWriter {
       op_ptr_ = op + length;
       return true;
     } else {
-      return false;
+      return length == 0;
     }
   }
 
-  inline bool AppendFromSelf(size_t offset, size_t len) {
+  inline bool AppendFromSelf(size_t offset, size_t len, bool) {
     char* const op_end = op_ptr_ + len;
     // See SnappyArrayWriter::AppendFromSelf for an explanation of
     // the "offset - 1u" trick.
